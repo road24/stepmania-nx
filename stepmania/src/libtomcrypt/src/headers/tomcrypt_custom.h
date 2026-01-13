@@ -447,6 +447,8 @@
  * superseeded by LTC_NO_MISC*/
 #ifndef LTC_NO_HKDF
 /* HKDF Key Derivation/Expansion stuff */
+
+#define LTC_HMAC
 #define LTC_HKDF
 #endif /* LTC_NO_HKDF */
 

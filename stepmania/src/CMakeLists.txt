@@ -621,6 +621,7 @@ if(SWITCH_LIBNX)
     "SDL2"
     "SDL2_ttf"
     "freetype"
+    "harfbuzz"
     "bz2"
     "z"
     "opus"

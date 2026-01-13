@@ -52,7 +52,7 @@ echo "* Building NRO"
 APP_VERSION="$(grep -oP '(?<=extern char const \* const product_version = ")[^"]+(?=";)' "$ROOT_DIR/stepmania/src/generated/verstub.cpp")"
 
 "$DEVKITPRO/tools/bin/nacptool" --create "$APP_TITLE$PROGRAM_SUFFIX" "$APP_AUTHOR" "$APP_VERSION" "$OUT_DIR/stepmania$PROGRAM_SUFFIX.nacp"
-cp -f "$STEPMANIA_DIR/stepmania$PROGRAM_SUFFIX" "$OUT_DIR/stepmania$PROGRAM_SUFFIX.elf"
+cp -f "$STEPMANIA_DIR/stepmania$PROGRAM_SUFFIX.elf" "$OUT_DIR/stepmania$PROGRAM_SUFFIX.elf"
 "$DEVKITPRO/tools/bin/elf2nro" "$OUT_DIR/stepmania$PROGRAM_SUFFIX.elf" "$OUT_DIR/stepmania$PROGRAM_SUFFIX.nro" \
 	--nacp="$OUT_DIR/stepmania$PROGRAM_SUFFIX.nacp" \
 	--icon="$ROOT_DIR/icon.jpg"
