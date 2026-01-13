@@ -29,7 +29,7 @@ INCLUDES="-I$DEVKITPRO/libnx/include -I$DEVKITPRO/portlibs/switch/include/SDL2"
 echo "* CMake"
 cmake -G"Unix Makefiles" "$ROOT_DIR" \
 	-DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE" \
-	-DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/switch.cmake" \
+	-DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" \
 	-DCMAKE_C_FLAGS="$CFLAGS $CPPFLAGS $DEFINES $INCLUDES" \
 	-DCMAKE_CXX_FLAGS="$CFLAGS $DEFINES $INCLUDES" \
 	-DCMAKE_AR="$DEVKITPRO/devkitA64/bin/aarch64-none-elf-gcc-ar" \
