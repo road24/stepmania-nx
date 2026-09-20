@@ -1,3 +1,8 @@
 .DS_Store
 build
 out
+.venv
+ffmpeg-nx-src
+ffmpeg-nx-prefix
+ffmpeg-hw-src
+ffmpeg-hw-prefix
