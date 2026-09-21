@@ -31,7 +31,7 @@
 #include "RageSurface_Load.h"
 #include "CommandLineActions.h"
 
-#if !defined(SUPPORT_OPENGL) && !defined(SUPPORT_D3D)
+#if !defined(SUPPORT_OPENGL) && !defined(SUPPORT_D3D) && !defined(SUPPORT_DEKO3D)
 #define SUPPORT_OPENGL
 #endif
 
@@ -474,7 +474,16 @@ static void AdjustForChangedSystemCapabilities()
 #include "RageDisplay_GLES2.h"
 #endif
 
+#if defined(SUPPORT_DEKO3D)
+#include "RageDisplay_Deko3D.h"
+#endif
+
+// RageDisplay_Null.cpp is excluded from the build entirely on Switch
+// (CMakeData-rage.cmake) - "all renderers but deko3d" means the no-op
+// renderer isn't linked in either, not just unreachable via preferences.
+#if !defined(SUPPORT_DEKO3D)
 #include "RageDisplay_Null.h"
+#endif
 
 
 struct VideoCardDefaults
@@ -651,7 +660,7 @@ struct VideoCardDefaults
 #if defined(__SWITCH__)
 	VideoCardDefaults(
 		"__SWITCH__",
-		"opengl",
+		"deko3d",
 		1280,720,
 		16,16,16,
 		2048,
@@ -834,10 +843,18 @@ RageDisplay *CreateDisplay()
 			pRet = new RageDisplay_D3D;
 #endif
 		}
+		else if( sRenderer.CompareNoCase("deko3d")==0 )
+		{
+#if defined(SUPPORT_DEKO3D)
+			pRet = new RageDisplay_Deko3D;
+#endif
+		}
+#if !defined(SUPPORT_DEKO3D)
 		else if( sRenderer.CompareNoCase("null")==0 )
 		{
 			return new RageDisplay_Null;
 		}
+#endif
 		else
 		{
 			RageException::Throw( ERROR_UNKNOWN_VIDEO_RENDERER.GetValue(), sRenderer.c_str() );

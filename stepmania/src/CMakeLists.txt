@@ -116,6 +116,10 @@ set_target_properties("${SM_EXE_NAME}"
 sm_add_compile_definition("${SM_EXE_NAME}" LTM_DESC)
 sm_add_compile_definition("${SM_EXE_NAME}" LTM_HMAC)
 
+if(SWITCH_LIBNX)
+  sm_add_compile_definition("${SM_EXE_NAME}" SUPPORT_DEKO3D)
+endif()
+
 if(WITH_PORTABLE_TOMCRYPT)
   sm_add_compile_definition("${SM_EXE_NAME}" LTC_NO_ASM)
 endif()
@@ -664,8 +668,61 @@ if(SWITCH_LIBNX)
     "EGL"
     "glapi"
     "drm_nouveau"
+    # TEMPORARY diagnostic swap: deko3dd (libdeko3dd.a) instead of deko3d
+    # (libdeko3d.a) - the debug variant devkitPro ships alongside the release
+    # one (both built from the same deko3d source, deko3dd with -DDEBUG=1).
+    # The release lib's RaiseError() (source/dk_device.cpp, the non-DEBUG
+    # branch) goes straight to diagAbortWithResult() and never calls cbDebug
+    # at all - DK_ENTRYPOINT/DK_WARNING/cbDebug dispatch are all compiled out
+    # entirely under #ifdef DEBUG in deko3d's own source, so the cbDebug hook
+    # wired up in RageDisplay_Deko3D.cpp is structurally unreachable against
+    # the release lib, regardless of anything on our side. The debug lib is
+    # what actually calls Queue::checkError() -> DK_WARNING with the real GPU
+    # channel error (page fault address + Read/Write access type, method
+    # error, rejected command list, or timeout - gpu_error.cpp) *before* the
+    # queue reaches the error state that dkQueueAcquireImage later aborts on.
+    # Revert to "deko3d" once that diagnostic data has been captured - this
+    # is not meant to ship.
+    "deko3dd"
     "nx"
   )
+
+  # Compile the Phase 1 deko3d sprite shaders (GLSL -> .dksh) via uam, the
+  # same offline compiler devkitPro's own deko3d examples use (see
+  # docs/architecture/11-Deko3D-TextureFormatAndShaderContract.md), as a
+  # POST_BUILD step on the StepMania target itself - runs every time the
+  # target builds, after linking, guaranteeing Data/Shaders/Deko3D/ is
+  # present and current for whatever process deploys Data/ alongside the
+  # built binary. Output goes into Data/Shaders/Deko3D/, alongside the
+  # existing Data/Shaders/GLSL/ theme-effect shaders - this project has no
+  # RomFS anywhere else, so shaders follow the same real-filesystem
+  # convention every other asset already uses (RageFileManager.cpp's
+  # ChangeToDirOfExecutable() resolves paths relative to the CWD on Switch).
+  find_program(UAM_EXECUTABLE uam PATHS "$ENV{DEVKITPRO}/tools/bin" REQUIRED)
+
+  set(DEKO3D_SHADER_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/deko3d_shaders")
+  set(DEKO3D_SHADER_OUT_DIR "${SM_ROOT_DIR}/Data/Shaders/Deko3D")
+  file(MAKE_DIRECTORY "${DEKO3D_SHADER_OUT_DIR}")
+
+  set(DEKO3D_SHADER_STAGES
+    "sprite_vsh:vert"
+    "sprite_modulate_fsh:frag"
+    "sprite_glow_fsh:frag"
+  )
+  foreach(SHADER_ENTRY ${DEKO3D_SHADER_STAGES})
+    string(REPLACE ":" ";" SHADER_ENTRY_LIST ${SHADER_ENTRY})
+    list(GET SHADER_ENTRY_LIST 0 SHADER_NAME)
+    list(GET SHADER_ENTRY_LIST 1 SHADER_STAGE)
+
+    set(SHADER_SRC "${DEKO3D_SHADER_SRC_DIR}/${SHADER_NAME}.glsl")
+    set(SHADER_OUT "${DEKO3D_SHADER_OUT_DIR}/${SHADER_NAME}.dksh")
+    add_custom_command(
+      TARGET "${SM_EXE_NAME}" POST_BUILD
+      COMMAND "${UAM_EXECUTABLE}" -s ${SHADER_STAGE} -o "${SHADER_OUT}" "${SHADER_SRC}"
+      COMMENT "Compiling deko3d shader ${SHADER_NAME}.glsl -> Data/Shaders/Deko3D/${SHADER_NAME}.dksh"
+      VERBATIM
+    )
+  endforeach()
 endif()
 
 target_link_libraries("${SM_EXE_NAME}" ${SMDATA_LINK_LIB})

@@ -52,8 +52,6 @@ source_group("Rage\\\\Misc"
 list(APPEND SMDATA_RAGE_GRAPHICS_SRC
             "RageBitmapTexture.cpp"
             "RageDisplay.cpp"
-            "RageDisplay_Null.cpp"
-            "RageDisplay_OGL.cpp"
             "RageDisplay_OGL_Helpers.cpp"
             "RageModelGeometry.cpp"
             "RageSurface.cpp"
@@ -78,8 +76,6 @@ list(APPEND SMDATA_RAGE_GRAPHICS_SRC
 list(APPEND SMDATA_RAGE_GRAPHICS_HPP
             "RageBitmapTexture.h"
             "RageDisplay.h"
-            "RageDisplay_Null.h"
-            "RageDisplay_OGL.h"
             "RageDisplay_OGL_Helpers.h"
             "RageModelGeometry.h"
             "RageSurface.h"
@@ -102,6 +98,22 @@ list(APPEND SMDATA_RAGE_GRAPHICS_HPP
             "RageTexturePreloader.h"
             "RageTextureRenderTarget.h")
 
+# RageDisplay_OGL.cpp/.h and RageDisplay_Null.cpp/.h are the OpenGL and
+# no-op renderer implementations, needed on every platform EXCEPT the
+# Switch build, where they must not be compiled or linked at all - not
+# merely excluded from runtime selection. RageDisplay_Legacy's OpenGL path
+# renders through Mesa/nouveau, which is the actual reason deko3d exists in
+# this project (08-Deko3D-Feasibility.md); leaving that renderer linked in
+# would let it silently mask a broken deko3d backend by succeeding via the
+# slow software path instead of surfacing a real error - confirmed to
+# already be exactly what was happening (StepMania.cpp's Switch video
+# defaults previously hardcoded "opengl", unconditionally overwriting
+# whatever was in the prefs file every launch).
+if(NOT SWITCH_LIBNX)
+  list(APPEND SMDATA_RAGE_GRAPHICS_SRC "RageDisplay_Null.cpp" "RageDisplay_OGL.cpp")
+  list(APPEND SMDATA_RAGE_GRAPHICS_HPP "RageDisplay_Null.h" "RageDisplay_OGL.h")
+endif()
+
 if(WIN32)
   list(APPEND SMDATA_RAGE_GRAPHICS_SRC "RageDisplay_D3D.cpp")
   list(APPEND SMDATA_RAGE_GRAPHICS_HPP "RageDisplay_D3D.h")
@@ -109,6 +121,10 @@ elseif(LINUX)
   if(WITH_GLES2)
     list(APPEND SMDATA_RAGE_GRAPHICS_SRC "RageDisplay_GLES2.cpp")
     list(APPEND SMDATA_RAGE_GRAPHICS_HPP "RageDisplay_GLES2.h")
+  endif()
+  if(SWITCH_LIBNX)
+    list(APPEND SMDATA_RAGE_GRAPHICS_SRC "Deko3DMemPool.cpp" "RageDisplay_Deko3D.cpp")
+    list(APPEND SMDATA_RAGE_GRAPHICS_HPP "Deko3DMemPool.h" "RageDisplay_Deko3D.h")
   endif()
 endif()
 
