@@ -306,23 +306,28 @@ void RageDisplay_Deko3D::BindDescriptorSets()
 
 void RageDisplay_Deko3D::RearmSetupCmdBuf()
 {
-	// m_SetupCmdBuf is used outside the per-frame lifecycle (texture loads
-	// can happen before the first frame, or at arbitrary points during a
-	// session), so it can't use the per-frame ring pools - it gets its own
-	// small pool instead, reset (Clear()) and re-fed before every use.
-	// Only BeginFrame()'s render-target bind and CreateTexture()'s load-time
-	// upload share this buffer/pool now - CreateTexture() always waitIdle()s
-	// before returning, so by the time either one runs again the GPU is
-	// genuinely done with the previous use. Streaming updates (movie frames)
-	// used to share this too and do NOT hold that invariant - BeginFrame()'s
-	// submission is never waited on, so a mid-frame UpdateTexture() call
-	// could reuse (Clear()) this same memory while the GPU was still reading
-	// this frame's render-target-bind commands from it, corrupting the
-	// command stream (a real, on-device "GPU method error" via
-	// dkCmdBufBarrier, root-caused through the debug deko3d lib's cbDebug).
-	// UpdateTexture() now has its own buffer/pool entirely
-	// (m_StreamingCmdBuf/m_pStreamingCmdPool, RearmStreamingCmdBuf() below)
-	// specifically so it can never race this one again.
+	// m_SetupCmdBuf is now used ONLY by BeginFrame()'s render-target bind
+	// (plus the one-time BindDescriptorSets() call at Init(), before any
+	// frame exists) - it gets its own small pool, reset (Clear()) and
+	// re-fed before every use.
+	//
+	// Texture uploads (CreateTexture() and UpdateTexture()) used to share
+	// this buffer/pool too, on the assumption that they only ever ran at
+	// safe, serialized load time. That assumption was wrong twice over, in
+	// two separate real on-device crashes (both a "GPU method error" via
+	// dkCmdBufBarrier, root-caused through the debug deko3d lib's cbDebug):
+	// UpdateTexture() runs mid-frame for streaming updates (movie frames),
+	// and CreateTexture() turned out to also run mid-frame in practice (e.g.
+	// entering ScreenGameplay creates textures after that frame's
+	// BeginFrame() has already run). BeginFrame()'s render-target-bind
+	// submission on THIS buffer is never waitIdle()'d, so either one
+	// reusing (Clear()ing) this same memory later in the same frame could
+	// corrupt render-target-bind commands the GPU might still be reading.
+	// Both texture-upload paths now share m_StreamingCmdBuf/
+	// m_pStreamingCmdPool instead (RearmStreamingCmdBuf() below) - safe
+	// between themselves (both fully synchronous, submit+waitIdle before
+	// returning, and StepMania's render loop is single-threaded so they
+	// can't overlap each other), just not safe sharing with this one.
 	m_SetupCmdBuf.clear();
 	m_pSetupCmdPool->Clear();
 	Deko3DAlloc cmdMem = m_pSetupCmdPool->Allocate( SETUP_CMD_POOL_SIZE, DK_CMDMEM_ALIGNMENT );
@@ -333,10 +338,10 @@ void RageDisplay_Deko3D::RearmSetupCmdBuf()
 void RageDisplay_Deko3D::RearmStreamingCmdBuf()
 {
 	// Mirrors RearmSetupCmdBuf(), on m_StreamingCmdBuf/m_pStreamingCmdPool
-	// instead - see the comment there for why UpdateTexture() needs its own,
-	// separate from m_SetupCmdBuf. UpdateTexture() itself always
-	// waitIdle()s before returning (mirroring CreateTexture()), so reusing
-	// this same memory on the next call is safe by the same reasoning.
+	// instead - shared by both CreateTexture() and UpdateTexture() (see the
+	// comment on RearmSetupCmdBuf() for why neither can share that one).
+	// Both always waitIdle() before returning, so reusing this same memory
+	// on the next call - by either of them - is safe by the same reasoning.
 	m_StreamingCmdBuf.clear();
 	m_pStreamingCmdPool->Clear();
 	Deko3DAlloc cmdMem = m_pStreamingCmdPool->Allocate( STREAMING_CMD_POOL_SIZE, DK_CMDMEM_ALIGNMENT );
@@ -821,11 +826,33 @@ uintptr_t RageDisplay_Deko3D::CreateTexture( RagePixelFormat pixfmt, RageSurface
 	RagePixelFormat actualFmt = GetImgPixelFormat( pImg, bFreeImg, pImg->w, pImg->h, pixfmt == RagePixelFormat_PAL );
 	DkImageFormat dkFormat = RagePixelFormatToDkImageFormat( actualFmt );
 
+	// RageTexture's UV math (RageTexture.h: GetImageToTexCoordsRatioX() =
+	// 1.0f/GetTextureWidth()) assumes every texture is allocated at a
+	// power-of-two size, with the real image content occupying only the
+	// top-left (pImg->w x pImg->h) sub-rect of it - RageBitmapTexture.cpp
+	// (the path every ordinary sprite/PNG texture goes through) pads pImg
+	// itself to that size before ever calling CreateTexture(), so pImg->w/h
+	// already equals the padded size there. MovieTexture_Generic.cpp does
+	// NOT do this - it computes m_iTextureWidth/Height as power-of-two
+	// (used for the same UV math) but hands CreateTexture() a surface at
+	// the raw, unpadded m_iImageWidth/Height. Since this function's image
+	// allocation used to just take pImg->w/h directly, movie textures ended
+	// up allocated at their real (non-padded) size while Sprite still
+	// divided by the padded size when computing UV coordinates - sampling
+	// only the top-left fraction of the texture and stretching it across
+	// the whole quad (a crop/zoom-in artifact, not a transform/scale bug).
+	// Padding the GPU allocation here - independent of whatever pImg->w/h
+	// already is - fixes movies and is a no-op for regular textures, which
+	// arrive already at a power-of-two size (power_of_two() of an existing
+	// power-of-two value returns that same value).
+	int iAllocWidth = power_of_two( pImg->w );
+	int iAllocHeight = power_of_two( pImg->h );
+
 	dk::ImageLayout layout;
 	dk::ImageLayoutMaker( m_Device )
 		.setFlags( 0 )
 		.setFormat( dkFormat )
-		.setDimensions( pImg->w, pImg->h )
+		.setDimensions( iAllocWidth, iAllocHeight )
 		.initialize( layout );
 
 	TextureRecord *pRec = new TextureRecord();
@@ -869,10 +896,24 @@ uintptr_t RageDisplay_Deko3D::CreateTexture( RagePixelFormat pixfmt, RageSurface
 			"m_pScratchPool likely exhausted, see SCRATCH_POOL_SIZE", iUploadSize).c_str() );
 	std::memcpy( staging.pCpuAddr, pImg->pixels, iUploadSize );
 
-	RearmSetupCmdBuf();
+	// Uses m_StreamingCmdBuf, NOT m_SetupCmdBuf - this was the actual cause
+	// of a second real on-device "GPU method error" crash (same signature as
+	// the one UpdateTexture() originally caused): CreateTexture() is not
+	// reliably called only at safe, pre-frame load time as originally
+	// assumed - e.g. entering ScreenGameplay creates textures mid-frame too,
+	// after BeginFrame()'s render-target-bind submission on m_SetupCmdBuf
+	// (which is never waitIdle()'d) but before that frame ends. Sharing
+	// m_SetupCmdBuf here would let this Clear()+reuse the same memory the
+	// GPU could still be reading. m_StreamingCmdBuf is fine to share with
+	// UpdateTexture() (Deko3D backend's own comment on RearmStreamingCmdBuf()):
+	// both are fully synchronous (submit+waitIdle before returning) and
+	// StepMania's render loop is single-threaded, so one always completes
+	// before the next begins - they just can't share with BeginFrame()'s
+	// un-waited submission.
+	RearmStreamingCmdBuf();
 	dk::ImageView imageView( pRec->Image );
-	m_SetupCmdBuf.copyBufferToImage( { staging.iGpuAddr }, imageView, { 0, 0, 0, (uint32_t)pImg->w, (uint32_t)pImg->h, 1 } );
-	m_Queue.submitCommands( m_SetupCmdBuf.finishList() );
+	m_StreamingCmdBuf.copyBufferToImage( { staging.iGpuAddr }, imageView, { 0, 0, 0, (uint32_t)pImg->w, (uint32_t)pImg->h, 1 } );
+	m_Queue.submitCommands( m_StreamingCmdBuf.finishList() );
 	m_Queue.waitIdle(); // synchronous, matching RageTextureManager's existing load-time (not per-frame) usage
 	m_pScratchPool->Clear();
 

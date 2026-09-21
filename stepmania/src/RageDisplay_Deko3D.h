@@ -199,19 +199,23 @@ private:
 	Deko3DFreeListPool *m_pImagePool;  // Pattern B: texture storage
 	Deko3DBumpPool *m_pScratchPool;    // Pattern C: texture upload staging (Clear()d between uploads)
 	Deko3DBumpPool *m_pSetupCmdPool;   // Pattern C: m_SetupCmdBuf's own command memory (Clear()d/re-fed before each use)
-	// Pattern C, but deliberately its OWN pool, not shared with
+	// Pattern C, but deliberately its OWN pool, shared by CreateTexture()
+	// AND UpdateTexture() (both texture-upload paths) and not with
 	// m_pSetupCmdPool: BeginFrame()'s render-target-bind submission via
-	// m_SetupCmdBuf is never waitIdle()'d (only CreateTexture()'s load-time
-	// uploads are), so the GPU can still be reading that memory later in the
-	// same frame. UpdateTexture() runs mid-frame too (from a movie's
-	// Sprite::Draw() call, not just at load time like CreateTexture()) - if
-	// it reused m_pSetupCmdPool via RearmSetupCmdBuf(), its Clear()+re-feed
-	// would overwrite render-target-bind commands the GPU might still be
-	// mid-read on, corrupting the command stream. Root-caused via a real
-	// on-device "GPU method error" (dkCmdBufBarrier, via the debug deko3d
-	// lib's cbDebug) that only appeared after several successful frames of
-	// movie playback - exactly the signature of a timing-dependent reuse
-	// race, not an immediate/deterministic bug.
+	// m_SetupCmdBuf is never waitIdle()'d, so the GPU can still be reading
+	// that memory later in the same frame. Both texture-upload paths can run
+	// mid-frame - UpdateTexture() always does (streaming movie frames, from
+	// a movie's Sprite::Draw() call), and CreateTexture() turned out to as
+	// well, despite the original design assuming it only ran at safe,
+	// pre-frame load time (e.g. entering ScreenGameplay creates textures
+	// mid-frame in practice). Sharing m_pSetupCmdPool from either path would
+	// let its Clear()+re-feed overwrite render-target-bind commands the GPU
+	// might still be mid-read on, corrupting the command stream. Root-caused
+	// via two separate real on-device "GPU method error" crashes
+	// (dkCmdBufBarrier, via the debug deko3d lib's cbDebug) - one from
+	// UpdateTexture() (after several frames of movie playback), one later
+	// from CreateTexture() (entering gameplay) - both exactly the signature
+	// of a timing-dependent reuse race, not an immediate/deterministic bug.
 	Deko3DBumpPool *m_pStreamingCmdPool;
 	Deko3DRingPool *m_pDynamicCmdPool; // Pattern D: per-frame command memory
 	Deko3DRingPool *m_pDynamicDataPool;// Pattern D: per-frame vertex + uniform data
