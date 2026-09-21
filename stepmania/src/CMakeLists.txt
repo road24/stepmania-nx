@@ -768,7 +768,10 @@ if(NOT APPLE)
     endif()
     if(HAS_FFMPEG)
       if(WITH_SYSTEM_FFMPEG)
-        list(APPEND SM_INCLUDE_DIRS "${FFMPEG_INCLUDE_DIR}")
+        # Must win over the shared devkitPro portlibs include dir (added by
+        # other libraries below/above), which also has its own libavformat
+        # headers that don't agree with FFMPEG_INCLUDE_DIR's.
+        list(PREPEND SM_INCLUDE_DIRS "${FFMPEG_INCLUDE_DIR}")
       else()
         add_dependencies("${SM_EXE_NAME}" "ffmpeg")
         list(APPEND SM_INCLUDE_DIRS "${SM_FFMPEG_SRC_DIR}" "${SM_FFMPEG_ROOT}")

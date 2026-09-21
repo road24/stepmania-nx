@@ -185,17 +185,34 @@ private:
 	dk::UniqueQueue m_Queue;
 
 	// One static command buffer for setup/teardown work (framebuffer binds,
-	// texture uploads); one dynamic command buffer + ring for per-frame
-	// sprite draw commands. See doc 09 S9 (CCmdMemRing pattern) and
-	// doc 10 (Pattern D pools).
+	// texture uploads at load time); one dynamic command buffer + ring for
+	// per-frame sprite draw commands; one more, separate, for streaming
+	// texture updates (UpdateTexture(), e.g. movie frames) - see
+	// m_pStreamingCmdPool below for why this can't share m_SetupCmdBuf. See
+	// doc 09 S9 (CCmdMemRing pattern) and doc 10 (Pattern D pools).
 	dk::UniqueCmdBuf m_SetupCmdBuf;
 	dk::UniqueCmdBuf m_DynamicCmdBuf;
+	dk::UniqueCmdBuf m_StreamingCmdBuf;
 
 	// -- Memory pools (10-Deko3D-MemoryAllocator.md) --
 	Deko3DBumpPool *m_pCodePool;       // Pattern A: shaders
 	Deko3DFreeListPool *m_pImagePool;  // Pattern B: texture storage
 	Deko3DBumpPool *m_pScratchPool;    // Pattern C: texture upload staging (Clear()d between uploads)
 	Deko3DBumpPool *m_pSetupCmdPool;   // Pattern C: m_SetupCmdBuf's own command memory (Clear()d/re-fed before each use)
+	// Pattern C, but deliberately its OWN pool, not shared with
+	// m_pSetupCmdPool: BeginFrame()'s render-target-bind submission via
+	// m_SetupCmdBuf is never waitIdle()'d (only CreateTexture()'s load-time
+	// uploads are), so the GPU can still be reading that memory later in the
+	// same frame. UpdateTexture() runs mid-frame too (from a movie's
+	// Sprite::Draw() call, not just at load time like CreateTexture()) - if
+	// it reused m_pSetupCmdPool via RearmSetupCmdBuf(), its Clear()+re-feed
+	// would overwrite render-target-bind commands the GPU might still be
+	// mid-read on, corrupting the command stream. Root-caused via a real
+	// on-device "GPU method error" (dkCmdBufBarrier, via the debug deko3d
+	// lib's cbDebug) that only appeared after several successful frames of
+	// movie playback - exactly the signature of a timing-dependent reuse
+	// race, not an immediate/deterministic bug.
+	Deko3DBumpPool *m_pStreamingCmdPool;
 	Deko3DRingPool *m_pDynamicCmdPool; // Pattern D: per-frame command memory
 	Deko3DRingPool *m_pDynamicDataPool;// Pattern D: per-frame vertex + uniform data
 	Deko3DDescriptorTable *m_pImageDescriptors;
@@ -210,6 +227,8 @@ private:
 	// fonts/splash textures load first) tried to grow via a cbAddMem
 	// callback that was never provided, and deko3d aborted the process.
 	void RearmSetupCmdBuf();
+	// Same idea as RearmSetupCmdBuf(), for m_StreamingCmdBuf/m_pStreamingCmdPool.
+	void RearmStreamingCmdBuf();
 
 	static const uint32_t NUM_DYNAMIC_SLICES = 2; // matches swapchain double-buffering
 	static const uint32_t MAX_LIVE_TEXTURES = 4096; // see doc 10's descriptor-table sizing note

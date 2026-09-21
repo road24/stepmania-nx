@@ -88,6 +88,7 @@ namespace
 	const uint32_t IMAGE_POOL_SIZE = 64 * 1024 * 1024;
 	const uint32_t SCRATCH_POOL_SIZE = 8 * 1024 * 1024;
 	const uint32_t SETUP_CMD_POOL_SIZE = 64 * 1024;
+	const uint32_t STREAMING_CMD_POOL_SIZE = 64 * 1024;
 	const uint32_t DYNAMIC_CMD_SLICE_SIZE = 128 * 1024;
 	const uint32_t DYNAMIC_DATA_SLICE_SIZE = 512 * 1024;
 
@@ -174,6 +175,7 @@ RageDisplay_Deko3D::RageDisplay_Deko3D():
 	m_pImagePool(nullptr),
 	m_pScratchPool(nullptr),
 	m_pSetupCmdPool(nullptr),
+	m_pStreamingCmdPool(nullptr),
 	m_pDynamicCmdPool(nullptr),
 	m_pDynamicDataPool(nullptr),
 	m_pImageDescriptors(nullptr),
@@ -200,6 +202,7 @@ RageDisplay_Deko3D::~RageDisplay_Deko3D()
 	delete m_pSamplerDescriptors;
 	delete m_pDynamicDataPool;
 	delete m_pDynamicCmdPool;
+	delete m_pStreamingCmdPool;
 	delete m_pSetupCmdPool;
 	delete m_pScratchPool;
 	delete m_pImagePool;
@@ -246,6 +249,7 @@ void RageDisplay_Deko3D::CreateDeviceAndQueue()
 
 	m_SetupCmdBuf = dk::CmdBufMaker(m_Device).create();
 	m_DynamicCmdBuf = dk::CmdBufMaker(m_Device).create();
+	m_StreamingCmdBuf = dk::CmdBufMaker(m_Device).create();
 }
 
 void RageDisplay_Deko3D::CreatePools()
@@ -262,6 +266,9 @@ void RageDisplay_Deko3D::CreatePools()
 	m_pSetupCmdPool = new Deko3DBumpPool( m_Device,
 		DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached,
 		SETUP_CMD_POOL_SIZE );
+	m_pStreamingCmdPool = new Deko3DBumpPool( m_Device,
+		DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached,
+		STREAMING_CMD_POOL_SIZE );
 
 	uint32_t iCmdMem = DYNAMIC_CMD_SLICE_SIZE;
 	m_pDynamicCmdPool = new Deko3DRingPool( m_Device,
@@ -303,16 +310,38 @@ void RageDisplay_Deko3D::RearmSetupCmdBuf()
 	// can happen before the first frame, or at arbitrary points during a
 	// session), so it can't use the per-frame ring pools - it gets its own
 	// small pool instead, reset (Clear()) and re-fed before every use.
-	// Each use is synchronous (submitCommands() + waitIdle() in
-	// CreateTexture(); BeginFrame()'s render-target bind is likewise
-	// submitted immediately), so reusing the same memory every time is
-	// safe - the GPU is always done with the previous use before this runs
-	// again.
+	// Only BeginFrame()'s render-target bind and CreateTexture()'s load-time
+	// upload share this buffer/pool now - CreateTexture() always waitIdle()s
+	// before returning, so by the time either one runs again the GPU is
+	// genuinely done with the previous use. Streaming updates (movie frames)
+	// used to share this too and do NOT hold that invariant - BeginFrame()'s
+	// submission is never waited on, so a mid-frame UpdateTexture() call
+	// could reuse (Clear()) this same memory while the GPU was still reading
+	// this frame's render-target-bind commands from it, corrupting the
+	// command stream (a real, on-device "GPU method error" via
+	// dkCmdBufBarrier, root-caused through the debug deko3d lib's cbDebug).
+	// UpdateTexture() now has its own buffer/pool entirely
+	// (m_StreamingCmdBuf/m_pStreamingCmdPool, RearmStreamingCmdBuf() below)
+	// specifically so it can never race this one again.
 	m_SetupCmdBuf.clear();
 	m_pSetupCmdPool->Clear();
 	Deko3DAlloc cmdMem = m_pSetupCmdPool->Allocate( SETUP_CMD_POOL_SIZE, DK_CMDMEM_ALIGNMENT );
 	ASSERT_M( cmdMem.IsValid(), "RageDisplay_Deko3D: setup command pool allocation failed" );
 	m_SetupCmdBuf.addMemory( cmdMem.hBlock, cmdMem.iOffset, cmdMem.iSize );
+}
+
+void RageDisplay_Deko3D::RearmStreamingCmdBuf()
+{
+	// Mirrors RearmSetupCmdBuf(), on m_StreamingCmdBuf/m_pStreamingCmdPool
+	// instead - see the comment there for why UpdateTexture() needs its own,
+	// separate from m_SetupCmdBuf. UpdateTexture() itself always
+	// waitIdle()s before returning (mirroring CreateTexture()), so reusing
+	// this same memory on the next call is safe by the same reasoning.
+	m_StreamingCmdBuf.clear();
+	m_pStreamingCmdPool->Clear();
+	Deko3DAlloc cmdMem = m_pStreamingCmdPool->Allocate( STREAMING_CMD_POOL_SIZE, DK_CMDMEM_ALIGNMENT );
+	ASSERT_M( cmdMem.IsValid(), "RageDisplay_Deko3D: streaming command pool allocation failed" );
+	m_StreamingCmdBuf.addMemory( cmdMem.hBlock, cmdMem.iOffset, cmdMem.iSize );
 }
 
 void RageDisplay_Deko3D::LoadShaders()
@@ -859,10 +888,62 @@ uintptr_t RageDisplay_Deko3D::CreateTexture( RagePixelFormat pixfmt, RageSurface
 
 void RageDisplay_Deko3D::UpdateTexture( uintptr_t iTexHandle, RageSurface *pImg, int iXOffset, int iYOffset, int iWidth, int iHeight )
 {
-	// Streaming updates (e.g. movie textures) aren't part of Phase 1's
-	// Sprite/Quad scope. Left unimplemented rather than silently wrong.
-	(void)iTexHandle; (void)pImg; (void)iXOffset; (void)iYOffset; (void)iWidth; (void)iHeight;
-	LOG->Warn( "RageDisplay_Deko3D::UpdateTexture: not implemented yet (Phase 1 is static sprite textures only)" );
+	// This was a no-op stub through Phase 1's initial static-sprite-only
+	// scope, which meant every streaming texture consumer (movies, chiefly
+	// MovieTexture_Generic::UpdateFrame(), MovieTexture_Generic.cpp:467/481)
+	// uploaded exactly one (blank/garbage, since CreateTexture() is first
+	// called with a nullptr-pixels placeholder surface - MovieTexture_Generic.cpp:160-168)
+	// frame and then silently never updated again: movies rendered as a
+	// frozen or blank/white texture instead of playing.
+	if( iTexHandle == 0 || iTexHandle > m_vTextures.size() )
+		return;
+	TextureRecord *pRec = m_vTextures[iTexHandle - 1];
+	if( pRec == nullptr )
+		return;
+
+	// Unlike CreateTexture(), this deliberately does NOT run pImg through
+	// GetImgPixelFormat()'s conversion path: the GPU-side image's format was
+	// fixed for good at creation time, and every caller (MovieTexture_Generic
+	// reuses the same RageSurfaceFormat, built once, for every frame it
+	// decodes into) is expected to keep handing back that same format -
+	// re-deriving/silently changing it here would corrupt what gets uploaded.
+	uint32_t iBytesPerPixel = (uint32_t)pImg->fmt.BytesPerPixel;
+	uint32_t iRowBytes = (uint32_t)iWidth * iBytesPerPixel;
+	uint32_t iUploadSize = iRowBytes * (uint32_t)iHeight;
+	if( iUploadSize == 0 )
+		return;
+
+	Deko3DAlloc staging = m_pScratchPool->Allocate( iUploadSize, DK_IMAGE_LINEAR_STRIDE_ALIGNMENT );
+	ASSERT_M( staging.IsValid(),
+		ssprintf("RageDisplay_Deko3D: streaming texture upload staging allocation failed (%u bytes) - "
+			"m_pScratchPool likely exhausted, see SCRATCH_POOL_SIZE", iUploadSize).c_str() );
+
+	// Copied row-by-row into the staging buffer rather than one memcpy:
+	// pImg->pitch can include padding beyond iWidth*BytesPerPixel, and the
+	// update region doesn't necessarily start at the surface's own origin,
+	// but copyBufferToImage()'s source buffer must be tightly packed to
+	// iWidth - unlike pImg itself, which may not be.
+	const uint8_t *pSrc = (const uint8_t *)pImg->pixels + (size_t)iYOffset * pImg->pitch + (size_t)iXOffset * iBytesPerPixel;
+	uint8_t *pDst = (uint8_t *)staging.pCpuAddr;
+	for( int y = 0; y < iHeight; ++y )
+	{
+		std::memcpy( pDst, pSrc, iRowBytes );
+		pSrc += pImg->pitch;
+		pDst += iRowBytes;
+	}
+
+	// Uses its own command buffer/pool (RearmStreamingCmdBuf(), not
+	// RearmSetupCmdBuf()) - see the comment on RearmSetupCmdBuf() for the
+	// real, on-device race this avoids: this can run mid-frame (from a
+	// movie's Sprite::Draw()), and BeginFrame()'s render-target bind on
+	// m_SetupCmdBuf is never waited on before that happens.
+	RearmStreamingCmdBuf();
+	dk::ImageView imageView( pRec->Image );
+	m_StreamingCmdBuf.copyBufferToImage( { staging.iGpuAddr }, imageView,
+		{ (uint32_t)iXOffset, (uint32_t)iYOffset, 0, (uint32_t)iWidth, (uint32_t)iHeight, 1 } );
+	m_Queue.submitCommands( m_StreamingCmdBuf.finishList() );
+	m_Queue.waitIdle(); // synchronous, matching CreateTexture()'s existing load-time pattern
+	m_pScratchPool->Clear();
 }
 
 void RageDisplay_Deko3D::DeleteTexture( uintptr_t iTexHandle )

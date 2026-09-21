@@ -6,6 +6,17 @@
 #include "MovieTexture_Generic.h"
 struct RageSurface;
 
+// Must come before the "namespace avcodec" block below: libavutil pulls in
+// these C headers unguarded, and this toolchain's cmath/cstdlib/etc. wrappers
+// use fully-qualified `using ::foo;` declarations that only resolve correctly
+// if the C header was first processed at true global scope, not nested in a
+// namespace.
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+
 namespace avcodec
 {
 	extern "C"

@@ -26,11 +26,27 @@ source "$DEVKITPRO/switchvars.sh"
 DEFINES="-g -D__SWITCH__ -DHAVE_LIBNX -DHAVE_EGL"
 INCLUDES="-I$DEVKITPRO/libnx/include -I$DEVKITPRO/portlibs/switch/include/SDL2"
 
+FFMPEG_CMAKE_ARGS=()
+if [[ -n "$FFMPEG_DIR" ]]; then
+	# FindFFMPEG.cmake's path guessing doesn't match a standard `make install`
+	# layout, and this cross-toolchain restricts find_path/find_library to its
+	# sysroot anyway, so hand it the resolved paths directly.
+	FFMPEG_CMAKE_ARGS=(
+		-DFFMPEG_INCLUDE_DIR="$FFMPEG_DIR/include"
+		-DFFMPEG_avformat_LIBRARY="$FFMPEG_DIR/lib/libavformat.a"
+		-DFFMPEG_avcodec_LIBRARY="$FFMPEG_DIR/lib/libavcodec.a"
+		-DFFMPEG_avutil_LIBRARY="$FFMPEG_DIR/lib/libavutil.a"
+		-DFFMPEG_swscale_LIBRARY="$FFMPEG_DIR/lib/libswscale.a"
+		-DFFMPEG_avdevice_LIBRARY="$FFMPEG_DIR/lib/libavdevice.a"
+	)
+fi
+
 echo "* CMake"
 cmake -G"Unix Makefiles" "$ROOT_DIR" \
 	-DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE" \
 	-DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
 	-DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" \
+	"${FFMPEG_CMAKE_ARGS[@]}" \
 	-DCMAKE_C_FLAGS="$CFLAGS $CPPFLAGS $DEFINES $INCLUDES" \
 	-DCMAKE_CXX_FLAGS="$CFLAGS $DEFINES $INCLUDES" \
 	-DCMAKE_AR="$DEVKITPRO/devkitA64/bin/aarch64-none-elf-gcc-ar" \
@@ -40,7 +56,7 @@ cmake -G"Unix Makefiles" "$ROOT_DIR" \
 	-DWITH_STATIC_LINKING=1 -DWITH_NETWORKING=0 \
 	-DWITH_SYSTEM_MAD=1 -DWITH_SYSTEM_OGG=1 \
 	-DWITH_SYSTEM_JPEG=1 -DWITH_SYSTEM_ZLIB=1 -DWITH_SYSTEM_PNG=1 \
-	-DWITH_FFMPEG=0 \
+	-DWITH_FFMPEG=1 -DWITH_SYSTEM_FFMPEG=1 -DHAS_FFMPEG=1 \
 	-DWITH_SDL=1 -DWITH_GLES2=0 -DWITH_CRASH_HANDLER=0 -DWITH_SSE2=0
 
 sed -i "s/-git-/-$APP_VERSION_TAG-/g" "$ROOT_DIR/stepmania/src/generated/verstub.cpp"
