@@ -582,6 +582,11 @@ bool RageDisplay_Deko3D::BeginFrame()
 	m_SetupCmdBuf.setViewports( 0, { { 0.0f, 0.0f, (float)m_iWidth, (float)m_iHeight, 0.0f, 1.0f } } );
 	m_SetupCmdBuf.setScissors( 0, { { 0, 0, (uint32_t)m_iWidth, (uint32_t)m_iHeight } } );
 
+	// No deko3d default clear, unlike RageDisplay_OGL.cpp:843-845's
+	// glClear() every frame - without it, stale content from 2 frames back
+	// (NUM_FRAMEBUFFERS==2) bleeds through.
+	m_SetupCmdBuf.clearColor( 0, DkColorMask_RGBA, 0.0f, 0.0f, 0.0f, 0.0f );
+
 	m_Queue.submitCommands( m_SetupCmdBuf.finishList() );
 
 	// Feed the dynamic command buffer ONE chunk of memory for the WHOLE
