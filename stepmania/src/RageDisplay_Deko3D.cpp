@@ -92,25 +92,50 @@ namespace
 	const uint32_t DYNAMIC_CMD_SLICE_SIZE = 128 * 1024;
 	const uint32_t DYNAMIC_DATA_SLICE_SIZE = 512 * 1024;
 
+	// RGB factors only, matching RageDisplay_Legacy::SetBlendMode's
+	// iSourceRGB/iDestRGB switch (RageDisplay_OGL.cpp:1881-1923) case-for-case.
+	// This previously only handled 5 of the 10 real BlendMode values (the
+	// rest silently fell through to Normal's factors), had BLEND_MODULATE's
+	// src/dst backwards (DstColor/Zero instead of Zero/SrcColor), and had
+	// BLEND_SUBTRACT copying BLEND_ADD's factors instead of Normal's (the
+	// "subtract" comes entirely from RageToDkBlendOp's Reverse-Subtract op,
+	// not from different factors - OGL confirms BLEND_SUBTRACT's
+	// iSourceRGB/iDestRGB are byte-for-byte identical to BLEND_NORMAL's).
+	// Root-caused via a real theme (raveitout's "ScreenSelectPlayMode
+	// background.lua") drawing an opaque white Quad with
+	// BlendMode_WeightedMultiply over a bg video: falling through to
+	// Normal's factors with an opaque white source (SrcAlpha=1) reduces to
+	// "replace with white," flattening the video to a solid white
+	// background - not a video-decoding bug, a missing blend-mode translation.
 	DkBlendFactor RageToDkBlendFactor( bool bSrc, BlendMode mode, bool bAlphaChannel )
 	{
-		// Only the src/dst factor PAIR actually varies by BlendMode; encode
-		// both together per mode rather than trying to decompose src/dst
-		// independently, since they're not independent choices in GL's own
-		// fixed-function blend equations either.
-		(void)bAlphaChannel;
+		(void)bAlphaChannel; // alpha factors are handled separately, hardcoded, at the FlushCommonState() call site
 		switch( mode )
 		{
 		case BLEND_ADD:
 			return bSrc ? DkBlendFactor_SrcAlpha : DkBlendFactor_One;
-		case BLEND_SUBTRACT: // handled via blend op, factors match ADD
-			return bSrc ? DkBlendFactor_SrcAlpha : DkBlendFactor_One;
 		case BLEND_MODULATE:
-			return bSrc ? DkBlendFactor_DstColor : DkBlendFactor_Zero;
+			return bSrc ? DkBlendFactor_Zero : DkBlendFactor_SrcColor;
 		case BLEND_COPY_SRC:
-		case BLEND_NO_EFFECT:
 			return bSrc ? DkBlendFactor_One : DkBlendFactor_Zero;
+		case BLEND_ALPHA_MASK:
+		case BLEND_ALPHA_KNOCK_OUT:
+		case BLEND_NO_EFFECT:
+			// RGB-identical in OGL too (BLEND_ALPHA_MASK/KNOCK_OUT only
+			// differ from each other in their alpha factors).
+			return bSrc ? DkBlendFactor_Zero : DkBlendFactor_One;
+		case BLEND_ALPHA_MULTIPLY:
+			return bSrc ? DkBlendFactor_SrcAlpha : DkBlendFactor_Zero;
+		case BLEND_WEIGHTED_MULTIPLY:
+			// "out = 2*(dst*src)" - 0.5 gray is identity, darker darkens,
+			// brighter (e.g. this session's white-Quad case) lightens.
+			return bSrc ? DkBlendFactor_DstColor : DkBlendFactor_SrcColor;
+		case BLEND_INVERT_DEST:
+			// "out = src - dst"; both factors are ONE, the subtraction
+			// itself comes from RageToDkBlendOp's DkBlendOp_Sub below.
+			return DkBlendFactor_One;
 		case BLEND_NORMAL:
+		case BLEND_SUBTRACT: // see comment above - same factors as Normal
 		default:
 			return bSrc ? DkBlendFactor_SrcAlpha : DkBlendFactor_InvSrcAlpha;
 		}
@@ -121,6 +146,7 @@ namespace
 		switch( mode )
 		{
 		case BLEND_SUBTRACT: return DkBlendOp_RevSub;
+		case BLEND_INVERT_DEST: return DkBlendOp_Sub;
 		default: return DkBlendOp_Add;
 		}
 	}
