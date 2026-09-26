@@ -78,8 +78,10 @@ protected:
 	virtual void DrawStripInternal( const RageSpriteVertex v[], int iNumVerts );
 	virtual void DrawTrianglesInternal( const RageSpriteVertex v[], int iNumVerts );
 	virtual void DrawCompiledGeometryInternal( const RageCompiledGeometry *p, int iMeshIndex );
-	virtual void DrawLineStripInternal( const RageSpriteVertex v[], int iNumVerts, float fLineWidth );
 	virtual void DrawSymmetricQuadStripInternal( const RageSpriteVertex v[], int iNumVerts );
+	// DrawLineStripInternal is NOT overridden: RageDisplay's own default
+	// (RageDisplay.cpp:228) builds it from DrawQuad()/DrawFan(), both
+	// implemented here already.
 
 	virtual RString TryVideoMode( const VideoModeParams &p, bool &bNewDeviceOut );
 	virtual RageSurface *CreateScreenshot(); // Phase 1: not implemented, see doc 10 open item on readback pools
@@ -143,6 +145,10 @@ private:
 	void FlushState( dk::CmdBuf cmdbuf );
 	dk::Sampler MakeSampler( bool bWrap, bool bFilter ) const;
 	int32_t GetOrCreateSamplerSlot( bool bWrap, bool bFilter );
+
+	// Shared body of every non-indexed Draw*Internal: upload vertices +
+	// matrix, bind state, issue one draw call with the given topology.
+	void DrawPrimitive( DkPrimitive prim, const RageSpriteVertex v[], int iNumVerts );
 
 	// -- Shader selection (doc 09 S4/S6) --
 	enum SpriteShaderVariant

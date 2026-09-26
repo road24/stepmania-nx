@@ -1142,46 +1142,25 @@ void RageDisplay_Deko3D::FlushState( dk::CmdBuf cmdbuf )
 	cmdbuf.bindTextures( DkStage_Fragment, 0, hTex );
 }
 
-void RageDisplay_Deko3D::DrawQuadsInternal( const RageSpriteVertex v[], int iNumVerts )
+// Shared by every non-indexed Draw*Internal. RageMatrix grouping/order and
+// vertex attrib layout (isBgra) as established for the original
+// DrawQuadsInternal (RageDisplay_OGL.cpp:1015,1028 matrix order; doc 11 for isBgra).
+void RageDisplay_Deko3D::DrawPrimitive( DkPrimitive prim, const RageSpriteVertex v[], int iNumVerts )
 {
 	if( iNumVerts <= 0 )
 		return;
 
-	// NOTE: does NOT clear()/addMemory()/finishList()/submit the command
-	// buffer here - that happens ONCE per frame, in BeginFrame()/EndFrame().
-	// This call only RECORDS more commands into the frame's already-fed
-	// buffer, so an arbitrary number of sprite draws can accumulate into
-	// one frame without exhausting the ring (see BeginFrame()'s comment for
-	// the bug this replaced).
-
-	// Upload this draw's vertex data into the per-frame ring (doc 09 S9 /
-	// doc 10 Pattern D) - Sprite.cpp rebuilds v[] fresh on every single
-	// call, so there is no static buffer to reuse across frames here.
 	uint32_t iVertBytes = sizeof(RageSpriteVertex) * iNumVerts;
 	Deko3DAlloc vertMem = m_pDynamicDataPool->Allocate( iVertBytes, alignof(RageSpriteVertex) );
 	ASSERT_M( vertMem.IsValid(), "RageDisplay_Deko3D: dynamic vertex ring exhausted for this frame" );
 	std::memcpy( vertMem.pCpuAddr, v, iVertBytes );
 
-	// Transform matrix: RageMatrix's raw bytes need no transpose for a GLSL
-	// mat4 - confirmed against RageDisplay_Legacy's own glLoadMatrixf() call
-	// sites (RageDisplay_OGL.cpp:1024 etc.), see doc 09's resolved finding.
-	//
-	// Grouping/order corrected against RageDisplay_OGL.cpp's own actual
-	// usage (RageDisplay_OGL.cpp:1015,1028) rather than assumed - the
-	// original version of this code grouped Centering with World and chained
-	// all four matrices in one pass, which is wrong on both counts: the real
-	// backend keeps two separate matrices (modelView = View-after-World,
-	// projection = Centering-after-Projection), matching GL's separate
-	// GL_MODELVIEW/GL_PROJECTION stacks. RageMatrixMultiply(pOut,pA,pB)
-	// computes pOut = pB*pA (pB applied first, confirmed by reading
-	// RageMath.cpp's actual multiply implementation, not assumed from the
-	// header declaration alone).
 	RageMatrix modelView;
-	RageMatrixMultiply( &modelView, GetViewTop(), GetWorldTop() );   // World applied first, then View
+	RageMatrixMultiply( &modelView, GetViewTop(), GetWorldTop() );
 	RageMatrix projection;
-	RageMatrixMultiply( &projection, GetCentering(), GetProjectionTop() ); // Projection applied first, then Centering
+	RageMatrixMultiply( &projection, GetCentering(), GetProjectionTop() );
 	RageMatrix final;
-	RageMatrixMultiply( &final, &projection, &modelView );           // modelView applied first, then projection
+	RageMatrixMultiply( &final, &projection, &modelView );
 
 	Deko3DAlloc uniformMem = m_pDynamicDataPool->Allocate( sizeof(RageMatrix), DK_UNIFORM_BUF_ALIGNMENT );
 	ASSERT_M( uniformMem.IsValid(), "RageDisplay_Deko3D: dynamic uniform ring exhausted for this frame" );
@@ -1189,19 +1168,12 @@ void RageDisplay_Deko3D::DrawQuadsInternal( const RageSpriteVertex v[], int iNum
 
 	FlushState( m_DynamicCmdBuf );
 
-	// Re-checked immediately at the bind, not just at allocation time above -
-	// this is the actual GPU address deko3d receives, and nothing should be
-	// allowed to reach it unvalidated.
 	ASSERT_M( uniformMem.IsValid(), "RageDisplay_Deko3D: uniform buffer GPU address is invalid at bind time" );
 	m_DynamicCmdBuf.bindUniformBuffer( DkStage_Vertex, 0, uniformMem.iGpuAddr, uniformMem.iSize );
 
-	// DkVtxAttribState's aggregate initializer takes only its 6 NAMED
-	// bitfields in order (bufferId, isFixed, offset, size, type, isBgra) -
-	// the two anonymous padding bitfields in between are skipped, matching
-	// every devkitPro example's own usage (e.g. Example04_TexturedCube.cpp:44-45).
 	std::array<DkVtxAttribState, 3> attribs = {{
 		{ 0, 0, (uint32_t)offsetof(RageSpriteVertex, p), DkVtxAttribSize_3x32, DkVtxAttribType_Float, 0 },
-		{ 0, 0, (uint32_t)offsetof(RageSpriteVertex, c), DkVtxAttribSize_4x8,  DkVtxAttribType_Unorm, 1 }, // isBgra=1, see doc 11
+		{ 0, 0, (uint32_t)offsetof(RageSpriteVertex, c), DkVtxAttribSize_4x8,  DkVtxAttribType_Unorm, 1 }, // isBgra=1
 		{ 0, 0, (uint32_t)offsetof(RageSpriteVertex, t), DkVtxAttribSize_2x32, DkVtxAttribType_Float, 0 },
 	}};
 	std::array<DkVtxBufferState, 1> vtxBufState = {{ { sizeof(RageSpriteVertex), 0 } }};
@@ -1210,25 +1182,80 @@ void RageDisplay_Deko3D::DrawQuadsInternal( const RageSpriteVertex v[], int iNum
 	ASSERT_M( vertMem.IsValid(), "RageDisplay_Deko3D: vertex buffer GPU address is invalid at bind time" );
 	m_DynamicCmdBuf.bindVtxBuffer( 0, vertMem.iGpuAddr, vertMem.iSize );
 
-	m_DynamicCmdBuf.draw( DkPrimitive_Quads, iNumVerts, 1, 0, 0 );
-
-	// No finishList()/submitCommands() here - this quad's commands stay
-	// recorded in the frame's shared buffer; EndFrame() submits the whole
-	// frame's accumulated draws in one call.
+	m_DynamicCmdBuf.draw( prim, iNumVerts, 1, 0, 0 );
 
 	StatsAddVerts( iNumVerts );
 }
 
-// The remaining primitive types aren't exercised by Sprite/Quad rendering
-// (09-Deko3D-SpritePipelineCache.md S1) - stubbed rather than silently
-// mis-drawing until a real caller shows up needing them.
-void RageDisplay_Deko3D::DrawQuadStripInternal( const RageSpriteVertex[], int ) { LOG->Warn( "RageDisplay_Deko3D::DrawQuadStripInternal: not implemented yet" ); }
-void RageDisplay_Deko3D::DrawFanInternal( const RageSpriteVertex[], int ) { LOG->Warn( "RageDisplay_Deko3D::DrawFanInternal: not implemented yet" ); }
-void RageDisplay_Deko3D::DrawStripInternal( const RageSpriteVertex[], int ) { LOG->Warn( "RageDisplay_Deko3D::DrawStripInternal: not implemented yet" ); }
-void RageDisplay_Deko3D::DrawTrianglesInternal( const RageSpriteVertex[], int ) { LOG->Warn( "RageDisplay_Deko3D::DrawTrianglesInternal: not implemented yet" ); }
+void RageDisplay_Deko3D::DrawQuadsInternal( const RageSpriteVertex v[], int iNumVerts ) { DrawPrimitive( DkPrimitive_Quads, v, iNumVerts ); }
+void RageDisplay_Deko3D::DrawQuadStripInternal( const RageSpriteVertex v[], int iNumVerts ) { DrawPrimitive( DkPrimitive_QuadStrip, v, iNumVerts ); }
+void RageDisplay_Deko3D::DrawFanInternal( const RageSpriteVertex v[], int iNumVerts ) { DrawPrimitive( DkPrimitive_TriangleFan, v, iNumVerts ); }
+void RageDisplay_Deko3D::DrawStripInternal( const RageSpriteVertex v[], int iNumVerts ) { DrawPrimitive( DkPrimitive_TriangleStrip, v, iNumVerts ); }
+void RageDisplay_Deko3D::DrawTrianglesInternal( const RageSpriteVertex v[], int iNumVerts ) { DrawPrimitive( DkPrimitive_Triangles, v, iNumVerts ); }
+
 void RageDisplay_Deko3D::DrawCompiledGeometryInternal( const RageCompiledGeometry *, int ) { LOG->Warn( "RageDisplay_Deko3D::DrawCompiledGeometryInternal: Phase 2, not implemented yet" ); }
-void RageDisplay_Deko3D::DrawLineStripInternal( const RageSpriteVertex[], int, float ) { LOG->Warn( "RageDisplay_Deko3D::DrawLineStripInternal: not implemented yet" ); }
-void RageDisplay_Deko3D::DrawSymmetricQuadStripInternal( const RageSpriteVertex[], int ) { LOG->Warn( "RageDisplay_Deko3D::DrawSymmetricQuadStripInternal: not implemented yet" ); }
+
+// Same index pattern as RageDisplay_OGL.cpp:1505-1531 (4 triangles per
+// 3-vertex "piece", used for hold/roll bodies - NoteDisplay.cpp:727).
+// deko3d has no native symmetric-quad-strip topology either, so this is
+// indexed DkPrimitive_Triangles, same as the GL glDrawElements() fallback.
+void RageDisplay_Deko3D::DrawSymmetricQuadStripInternal( const RageSpriteVertex v[], int iNumVerts )
+{
+	if( iNumVerts <= 0 )
+		return;
+
+	int iNumPieces = (iNumVerts-3)/3;
+	int iNumIndices = iNumPieces*4*3;
+	if( iNumIndices <= 0 )
+		return;
+
+	uint32_t iVertBytes = sizeof(RageSpriteVertex) * iNumVerts;
+	Deko3DAlloc vertMem = m_pDynamicDataPool->Allocate( iVertBytes, alignof(RageSpriteVertex) );
+	ASSERT_M( vertMem.IsValid(), "RageDisplay_Deko3D: dynamic vertex ring exhausted for this frame" );
+	std::memcpy( vertMem.pCpuAddr, v, iVertBytes );
+
+	uint32_t iIdxBytes = sizeof(uint16_t) * iNumIndices;
+	Deko3DAlloc idxMem = m_pDynamicDataPool->Allocate( iIdxBytes, alignof(uint16_t) );
+	ASSERT_M( idxMem.IsValid(), "RageDisplay_Deko3D: dynamic index ring exhausted for this frame" );
+	uint16_t *pIdx = (uint16_t *)idxMem.pCpuAddr;
+	for( int i = 0; i < iNumPieces; i++ )
+	{
+		pIdx[i*12+0] = i*3+1; pIdx[i*12+1] = i*3+3; pIdx[i*12+2] = i*3+0;
+		pIdx[i*12+3] = i*3+1; pIdx[i*12+4] = i*3+4; pIdx[i*12+5] = i*3+3;
+		pIdx[i*12+6] = i*3+1; pIdx[i*12+7] = i*3+5; pIdx[i*12+8] = i*3+4;
+		pIdx[i*12+9] = i*3+1; pIdx[i*12+10] = i*3+2; pIdx[i*12+11] = i*3+5;
+	}
+
+	RageMatrix modelView;
+	RageMatrixMultiply( &modelView, GetViewTop(), GetWorldTop() );
+	RageMatrix projection;
+	RageMatrixMultiply( &projection, GetCentering(), GetProjectionTop() );
+	RageMatrix final;
+	RageMatrixMultiply( &final, &projection, &modelView );
+
+	Deko3DAlloc uniformMem = m_pDynamicDataPool->Allocate( sizeof(RageMatrix), DK_UNIFORM_BUF_ALIGNMENT );
+	ASSERT_M( uniformMem.IsValid(), "RageDisplay_Deko3D: dynamic uniform ring exhausted for this frame" );
+	std::memcpy( uniformMem.pCpuAddr, &final, sizeof(RageMatrix) );
+
+	FlushState( m_DynamicCmdBuf );
+	m_DynamicCmdBuf.bindUniformBuffer( DkStage_Vertex, 0, uniformMem.iGpuAddr, uniformMem.iSize );
+
+	std::array<DkVtxAttribState, 3> attribs = {{
+		{ 0, 0, (uint32_t)offsetof(RageSpriteVertex, p), DkVtxAttribSize_3x32, DkVtxAttribType_Float, 0 },
+		{ 0, 0, (uint32_t)offsetof(RageSpriteVertex, c), DkVtxAttribSize_4x8,  DkVtxAttribType_Unorm, 1 },
+		{ 0, 0, (uint32_t)offsetof(RageSpriteVertex, t), DkVtxAttribSize_2x32, DkVtxAttribType_Float, 0 },
+	}};
+	std::array<DkVtxBufferState, 1> vtxBufState = {{ { sizeof(RageSpriteVertex), 0 } }};
+	m_DynamicCmdBuf.bindVtxAttribState( attribs );
+	m_DynamicCmdBuf.bindVtxBufferState( vtxBufState );
+	m_DynamicCmdBuf.bindVtxBuffer( 0, vertMem.iGpuAddr, vertMem.iSize );
+
+	ASSERT_M( idxMem.IsValid(), "RageDisplay_Deko3D: index buffer GPU address is invalid at bind time" );
+	m_DynamicCmdBuf.bindIdxBuffer( DkIdxFormat_Uint16, idxMem.iGpuAddr );
+	m_DynamicCmdBuf.drawIndexed( DkPrimitive_Triangles, iNumIndices, 1, 0, 0, 0 );
+
+	StatsAddVerts( iNumVerts );
+}
 
 /*
  * Copyright (c) 2026 the StepMania-nx contributors
