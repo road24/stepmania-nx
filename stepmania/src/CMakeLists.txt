@@ -708,6 +708,8 @@ if(SWITCH_LIBNX)
     "sprite_vsh:vert"
     "sprite_modulate_fsh:frag"
     "sprite_glow_fsh:frag"
+    "model_vsh:vert"
+    "model_fsh:frag"
   )
   foreach(SHADER_ENTRY ${DEKO3D_SHADER_STAGES})
     string(REPLACE ":" ";" SHADER_ENTRY_LIST ${SHADER_ENTRY})

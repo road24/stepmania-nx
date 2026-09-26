@@ -96,6 +96,7 @@ namespace
 	const uint32_t STREAMING_CMD_POOL_SIZE = 64 * 1024;
 	const uint32_t DYNAMIC_CMD_SLICE_SIZE = 128 * 1024;
 	const uint32_t DYNAMIC_DATA_SLICE_SIZE = 512 * 1024;
+	const uint32_t MODEL_GEOMETRY_POOL_SIZE = 8 * 1024 * 1024;
 
 	// RGB factors only, matching RageDisplay_Legacy::SetBlendMode's
 	// iSourceRGB/iDestRGB switch (RageDisplay_OGL.cpp:1881-1923) case-for-case.
@@ -211,6 +212,7 @@ RageDisplay_Deko3D::RageDisplay_Deko3D():
 	m_pDynamicDataPool(nullptr),
 	m_pImageDescriptors(nullptr),
 	m_pSamplerDescriptors(nullptr),
+	m_pModelGeometryPool(nullptr),
 	m_VertexShader(),
 	m_iWidth(0),
 	m_iHeight(0),
@@ -231,6 +233,7 @@ RageDisplay_Deko3D::~RageDisplay_Deko3D()
 
 	delete m_pImageDescriptors;
 	delete m_pSamplerDescriptors;
+	delete m_pModelGeometryPool;
 	delete m_pDynamicDataPool;
 	delete m_pDynamicCmdPool;
 	delete m_pStreamingCmdPool;
@@ -313,6 +316,11 @@ void RageDisplay_Deko3D::CreatePools()
 		sizeof(DkImageDescriptor), DK_IMAGE_DESCRIPTOR_ALIGNMENT );
 	m_pSamplerDescriptors = new Deko3DDescriptorTable( m_Device, 4, // exactly 4: TextureWrapping x TextureFiltering
 		sizeof(DkSamplerDescriptor), DK_SAMPLER_DESCRIPTOR_ALIGNMENT );
+
+	// CPU-visible: memcpy'd directly in Change(), no texture-style staging.
+	m_pModelGeometryPool = new Deko3DFreeListPool( m_Device,
+		DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached,
+		MODEL_GEOMETRY_POOL_SIZE );
 }
 
 void RageDisplay_Deko3D::BindDescriptorSets()
@@ -420,6 +428,8 @@ void RageDisplay_Deko3D::LoadShaders()
 	loadOne( &m_VertexShader, "Data/Shaders/Deko3D/sprite_vsh.dksh" );
 	loadOne( &m_FragmentShaders[SpriteShader_Modulate], "Data/Shaders/Deko3D/sprite_modulate_fsh.dksh" );
 	loadOne( &m_FragmentShaders[SpriteShader_Glow], "Data/Shaders/Deko3D/sprite_glow_fsh.dksh" );
+	loadOne( &m_ModelVertexShader, "Data/Shaders/Deko3D/model_vsh.dksh" );
+	loadOne( &m_ModelFragmentShader, "Data/Shaders/Deko3D/model_fsh.dksh" );
 }
 
 dk::Sampler RageDisplay_Deko3D::MakeSampler( bool bWrap, bool bFilter ) const
@@ -702,25 +712,211 @@ void RageDisplay_Deko3D::SetEffectMode( EffectMode em ) { m_Pending.effectMode =
 bool RageDisplay_Deko3D::IsEffectModeSupported( EffectMode em ) { return em == EffectMode_Normal; } // only Normal has a shader in Phase 1
 
 // ---------------------------------------------------------------------
-// Phase 2 stubs (Model lighting/materials) - see doc 09 S10
+// Model lighting/materials (doc 09 S10). Only light index 0 is tracked -
+// the only index any real caller uses (see header comment).
 // ---------------------------------------------------------------------
 
-void RageDisplay_Deko3D::SetMaterial( const RageColor &, const RageColor &, const RageColor &, const RageColor &, float )
+RageDisplay_Deko3D::ModelLightState::ModelLightState():
+	emissive(0,0,0,1), ambient(0,0,0,1), diffuse(1,1,1,1),
+	bLightingEnabled(false), bLight0Enabled(false),
+	light0Ambient(0,0,0,1), light0Diffuse(1,1,1,1),
+	light0Dir(0,0,-1)
 {
-	LOG->Warn( "RageDisplay_Deko3D::SetMaterial: Model lighting is Phase 2, not implemented yet" );
 }
-void RageDisplay_Deko3D::SetLighting( bool ) { }
-void RageDisplay_Deko3D::SetLightOff( int ) { }
-void RageDisplay_Deko3D::SetLightDirectional( int, const RageColor &, const RageColor &, const RageColor &, const RageVector3 & ) { }
+
+void RageDisplay_Deko3D::SetMaterial( const RageColor &emissive, const RageColor &ambient,
+	const RageColor &diffuse, const RageColor &/*specular*/, float /*shininess*/ )
+{
+	// Specular/shininess not tracked - no eye-position uniform to compute it with.
+	m_ModelLight.emissive = emissive;
+	m_ModelLight.ambient = ambient;
+	m_ModelLight.diffuse = diffuse;
+}
+
+void RageDisplay_Deko3D::SetLighting( bool b ) { m_ModelLight.bLightingEnabled = b; }
+
+void RageDisplay_Deko3D::SetLightOff( int index )
+{
+	if( index == 0 )
+		m_ModelLight.bLight0Enabled = false;
+}
+
+void RageDisplay_Deko3D::SetLightDirectional( int index, const RageColor &ambient,
+	const RageColor &diffuse, const RageColor &/*specular*/, const RageVector3 &dir )
+{
+	if( index != 0 )
+		return;
+	m_ModelLight.bLight0Enabled = true;
+	m_ModelLight.light0Ambient = ambient;
+	m_ModelLight.light0Diffuse = diffuse;
+	m_ModelLight.light0Dir = dir;
+}
+
 void RageDisplay_Deko3D::SetSphereEnvironmentMapping( TextureUnit, bool ) { }
 void RageDisplay_Deko3D::SetCelShaded( int ) { }
 
+namespace
+{
+	// std140-friendly (vec4/mat4-sized fields) - matches model_*.glsl's uniform blocks.
+	struct ModelTransformUniform
+	{
+		RageMatrix mvp;
+		RageMatrix world;
+	};
+
+	struct ModelMaterialLightUniform
+	{
+		float matEmissive[4];
+		float matAmbient[4];
+		float matDiffuse[4];
+		float flags[4]; // x=lighting enabled, y=light0 enabled
+		float lightAmbient[4];
+		float lightDiffuse[4];
+		float lightDirWorld[4];
+	};
+
+	// RageModelVertex has no color (models use material color); GPU-side
+	// layout for model_vsh.glsl's inPosition/inNormal/inTexCoord.
+	struct ModelVertexGpu
+	{
+		RageVector3 p;
+		RageVector3 n;
+		RageVector2 t;
+	};
+}
+
+// Private per-backend subclass, same pattern as RageCompiledGeometrySWOGL/
+// HWOGL and RageCompiledGeometrySWD3D - not a new engine-wide abstraction.
+class RageCompiledGeometryDeko3D : public RageCompiledGeometry
+{
+public:
+	RageCompiledGeometryDeko3D( RageDisplay_Deko3D *pOwner ): m_pOwner(pOwner) { }
+	~RageCompiledGeometryDeko3D()
+	{
+		if( m_VertMem.IsValid() )
+			m_pOwner->m_pModelGeometryPool->Free( m_VertMem );
+		if( m_IdxMem.IsValid() )
+			m_pOwner->m_pModelGeometryPool->Free( m_IdxMem );
+	}
+
+	void Allocate( const vector<msMesh> &/*vMeshes*/ )
+	{
+		if( m_VertMem.IsValid() )
+			m_pOwner->m_pModelGeometryPool->Free( m_VertMem );
+		if( m_IdxMem.IsValid() )
+			m_pOwner->m_pModelGeometryPool->Free( m_IdxMem );
+
+		size_t iNumVerts = max( 1u, GetTotalVertices() );
+		size_t iNumTriangles = max( 1u, GetTotalTriangles() );
+		uint32_t iVertBytes = (uint32_t)( iNumVerts * sizeof(ModelVertexGpu) );
+		uint32_t iIdxBytes = (uint32_t)( iNumTriangles * 3 * sizeof(uint16_t) );
+
+		m_VertMem = m_pOwner->m_pModelGeometryPool->Allocate( iVertBytes, alignof(ModelVertexGpu) );
+		m_IdxMem = m_pOwner->m_pModelGeometryPool->Allocate( iIdxBytes, alignof(uint16_t) );
+		ASSERT_M( m_VertMem.IsValid() && m_IdxMem.IsValid(),
+			"RageDisplay_Deko3D: model geometry pool allocation failed - see MODEL_GEOMETRY_POOL_SIZE" );
+	}
+
+	void Change( const vector<msMesh> &vMeshes )
+	{
+		ModelVertexGpu *pVerts = (ModelVertexGpu *)m_VertMem.pCpuAddr;
+		uint16_t *pIdx = (uint16_t *)m_IdxMem.pCpuAddr;
+
+		for( unsigned i = 0; i < vMeshes.size(); ++i )
+		{
+			const MeshInfo &meshInfo = m_vMeshInfo[i];
+			const msMesh &mesh = vMeshes[i];
+			const vector<RageModelVertex> &Vertices = mesh.Vertices;
+			const vector<msTriangle> &Triangles = mesh.Triangles;
+
+			for( unsigned j = 0; j < Vertices.size(); ++j )
+			{
+				ModelVertexGpu &v = pVerts[meshInfo.iVertexStart + j];
+				v.p = Vertices[j].p;
+				v.n = Vertices[j].n;
+				v.t = Vertices[j].t;
+			}
+
+			// Indices are absolute (offset by iVertexStart) - all meshes share one buffer pair.
+			for( unsigned j = 0; j < Triangles.size(); ++j )
+				for( int k = 0; k < 3; ++k )
+					pIdx[(meshInfo.iTriangleStart+j)*3+k] = (uint16_t)(meshInfo.iVertexStart + Triangles[j].nVertexIndices[k]);
+		}
+	}
+
+	void Draw( int iMeshIndex ) const
+	{
+		const MeshInfo &meshInfo = m_vMeshInfo[iMeshIndex];
+		if( meshInfo.iTriangleCount <= 0 )
+			return;
+
+		dk::CmdBuf cmdbuf = m_pOwner->m_DynamicCmdBuf;
+		std::array<DkVtxAttribState, 3> attribs = {{
+			{ 0, 0, (uint32_t)offsetof(ModelVertexGpu, p), DkVtxAttribSize_3x32, DkVtxAttribType_Float, 0 },
+			{ 0, 0, (uint32_t)offsetof(ModelVertexGpu, n), DkVtxAttribSize_3x32, DkVtxAttribType_Float, 0 },
+			{ 0, 0, (uint32_t)offsetof(ModelVertexGpu, t), DkVtxAttribSize_2x32, DkVtxAttribType_Float, 0 },
+		}};
+		std::array<DkVtxBufferState, 1> vtxBufState = {{ { sizeof(ModelVertexGpu), 0 } }};
+		cmdbuf.bindVtxAttribState( attribs );
+		cmdbuf.bindVtxBufferState( vtxBufState );
+		cmdbuf.bindVtxBuffer( 0, m_VertMem.iGpuAddr, m_VertMem.iSize );
+		cmdbuf.bindIdxBuffer( DkIdxFormat_Uint16, m_IdxMem.iGpuAddr );
+		// vertexOffset=0: indices already store absolute vertex indices (see Change()).
+		cmdbuf.drawIndexed( DkPrimitive_Triangles, meshInfo.iTriangleCount * 3, 1, meshInfo.iTriangleStart * 3, 0, 0 );
+	}
+
+private:
+	RageDisplay_Deko3D *m_pOwner;
+	Deko3DAlloc m_VertMem;
+	Deko3DAlloc m_IdxMem;
+};
+
 RageCompiledGeometry *RageDisplay_Deko3D::CreateCompiledGeometry()
 {
-	LOG->Warn( "RageDisplay_Deko3D::CreateCompiledGeometry: Model geometry is Phase 2, not implemented yet" );
-	return nullptr;
+	return new RageCompiledGeometryDeko3D( this );
 }
-void RageDisplay_Deko3D::DeleteCompiledGeometry( RageCompiledGeometry * ) { }
+void RageDisplay_Deko3D::DeleteCompiledGeometry( RageCompiledGeometry *p ) { delete p; }
+
+void RageDisplay_Deko3D::DrawCompiledGeometryInternal( const RageCompiledGeometry *p, int iMeshIndex )
+{
+	ModelTransformUniform transform;
+	RageMatrix modelView;
+	RageMatrixMultiply( &modelView, GetViewTop(), GetWorldTop() );
+	RageMatrix projection;
+	RageMatrixMultiply( &projection, GetCentering(), GetProjectionTop() );
+	RageMatrixMultiply( &transform.mvp, &projection, &modelView );
+	transform.world = *GetWorldTop();
+
+	Deko3DAlloc transformMem = m_pDynamicDataPool->Allocate( sizeof(transform), DK_UNIFORM_BUF_ALIGNMENT );
+	ASSERT_M( transformMem.IsValid(), "RageDisplay_Deko3D: dynamic uniform ring exhausted for this frame (model transform)" );
+	std::memcpy( transformMem.pCpuAddr, &transform, sizeof(transform) );
+
+	ModelMaterialLightUniform ml;
+	std::memcpy( ml.matEmissive, (const float *)m_ModelLight.emissive, sizeof(ml.matEmissive) );
+	std::memcpy( ml.matAmbient, (const float *)m_ModelLight.ambient, sizeof(ml.matAmbient) );
+	std::memcpy( ml.matDiffuse, (const float *)m_ModelLight.diffuse, sizeof(ml.matDiffuse) );
+	ml.flags[0] = m_ModelLight.bLightingEnabled ? 1.0f : 0.0f;
+	ml.flags[1] = m_ModelLight.bLight0Enabled ? 1.0f : 0.0f;
+	ml.flags[2] = ml.flags[3] = 0.0f;
+	std::memcpy( ml.lightAmbient, (const float *)m_ModelLight.light0Ambient, sizeof(ml.lightAmbient) );
+	std::memcpy( ml.lightDiffuse, (const float *)m_ModelLight.light0Diffuse, sizeof(ml.lightDiffuse) );
+	ml.lightDirWorld[0] = m_ModelLight.light0Dir.x;
+	ml.lightDirWorld[1] = m_ModelLight.light0Dir.y;
+	ml.lightDirWorld[2] = m_ModelLight.light0Dir.z;
+	ml.lightDirWorld[3] = 0.0f;
+
+	Deko3DAlloc mlMem = m_pDynamicDataPool->Allocate( sizeof(ml), DK_UNIFORM_BUF_ALIGNMENT );
+	ASSERT_M( mlMem.IsValid(), "RageDisplay_Deko3D: dynamic uniform ring exhausted for this frame (model material/light)" );
+	std::memcpy( mlMem.pCpuAddr, &ml, sizeof(ml) );
+
+	FlushCommonState( m_DynamicCmdBuf );
+	std::array<DkShader const *, 2> shaders = { &m_ModelVertexShader, &m_ModelFragmentShader };
+	m_DynamicCmdBuf.bindShaders( DkStageFlag_Vertex | DkStageFlag_Fragment, shaders );
+	m_DynamicCmdBuf.bindUniformBuffer( DkStage_Vertex, 0, transformMem.iGpuAddr, transformMem.iSize );
+	m_DynamicCmdBuf.bindUniformBuffer( DkStage_Fragment, 1, mlMem.iGpuAddr, mlMem.iSize );
+
+	p->Draw( iMeshIndex );
+}
 
 RageSurface *RageDisplay_Deko3D::CreateScreenshot()
 {
@@ -1056,6 +1252,15 @@ RageDisplay_Deko3D::SpriteShaderVariant RageDisplay_Deko3D::GetShaderVariantForC
 
 void RageDisplay_Deko3D::FlushState( dk::CmdBuf cmdbuf )
 {
+	FlushCommonState( cmdbuf );
+
+	SpriteShaderVariant variant = GetShaderVariantForCurrentState();
+	std::array<DkShader const *, 2> shaders = { &m_VertexShader, &m_FragmentShaders[variant] };
+	cmdbuf.bindShaders( DkStageFlag_Vertex | DkStageFlag_Fragment, shaders );
+}
+
+void RageDisplay_Deko3D::FlushCommonState( dk::CmdBuf cmdbuf )
+{
 	dk::RasterizerState rasterizerState;
 	switch( m_Pending.cullMode )
 	{
@@ -1093,10 +1298,6 @@ void RageDisplay_Deko3D::FlushState( dk::CmdBuf cmdbuf )
 	depthState.setDepthTestEnable( m_Pending.bZTest );
 	depthState.setDepthWriteEnable( m_Pending.bZWrite );
 	cmdbuf.bindDepthStencilState( depthState );
-
-	SpriteShaderVariant variant = GetShaderVariantForCurrentState();
-	std::array<DkShader const *, 2> shaders = { &m_VertexShader, &m_FragmentShaders[variant] };
-	cmdbuf.bindShaders( DkStageFlag_Vertex | DkStageFlag_Fragment, shaders );
 
 	// ALWAYS bind something to fragment-stage slot 0, even for "no texture"
 	// draws (m_Pending.iBoundTexture==0) - both shader variants unconditionally
@@ -1142,9 +1343,10 @@ void RageDisplay_Deko3D::FlushState( dk::CmdBuf cmdbuf )
 	cmdbuf.bindTextures( DkStage_Fragment, 0, hTex );
 }
 
-// Shared by every non-indexed Draw*Internal. RageMatrix grouping/order and
-// vertex attrib layout (isBgra) as established for the original
-// DrawQuadsInternal (RageDisplay_OGL.cpp:1015,1028 matrix order; doc 11 for isBgra).
+// Shared by every non-indexed Draw*Internal (see header). RageMatrix
+// grouping/order and vertex attrib layout are as established for
+// DrawQuadsInternal originally - see git history for the citations
+// (RageDisplay_OGL.cpp:1015,1028 matrix order; doc 11 for isBgra).
 void RageDisplay_Deko3D::DrawPrimitive( DkPrimitive prim, const RageSpriteVertex v[], int iNumVerts )
 {
 	if( iNumVerts <= 0 )
@@ -1192,8 +1394,6 @@ void RageDisplay_Deko3D::DrawQuadStripInternal( const RageSpriteVertex v[], int 
 void RageDisplay_Deko3D::DrawFanInternal( const RageSpriteVertex v[], int iNumVerts ) { DrawPrimitive( DkPrimitive_TriangleFan, v, iNumVerts ); }
 void RageDisplay_Deko3D::DrawStripInternal( const RageSpriteVertex v[], int iNumVerts ) { DrawPrimitive( DkPrimitive_TriangleStrip, v, iNumVerts ); }
 void RageDisplay_Deko3D::DrawTrianglesInternal( const RageSpriteVertex v[], int iNumVerts ) { DrawPrimitive( DkPrimitive_Triangles, v, iNumVerts ); }
-
-void RageDisplay_Deko3D::DrawCompiledGeometryInternal( const RageCompiledGeometry *, int ) { LOG->Warn( "RageDisplay_Deko3D::DrawCompiledGeometryInternal: Phase 2, not implemented yet" ); }
 
 // Same index pattern as RageDisplay_OGL.cpp:1505-1531 (4 triangles per
 // 3-vertex "piece", used for hold/roll bodies - NoteDisplay.cpp:727).

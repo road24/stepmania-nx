@@ -1,10 +1,9 @@
 /* RageDisplay_Deko3D - Nintendo Switch deko3d renderer.
  *
- * Phase 1 scope (see docs/architecture/08-Deko3D-Feasibility.md and
- * 09-Deko3D-SpritePipelineCache.md): Sprite/Quad drawing only. Model
- * lighting/cel-shading (Phase 2) is not implemented yet - those entry
- * points exist because they're part of RageDisplay's required interface,
- * but are stubbed to fail loudly rather than silently mis-render.
+ * Phase 1 (see docs/architecture/08-Deko3D-Feasibility.md and
+ * 09-Deko3D-SpritePipelineCache.md): Sprite/Quad drawing. Phase 2: Model
+ * geometry, one directional light (index 0 only - the only light index any
+ * real caller ever uses), ambient+diffuse, no specular/cel-shading yet.
  */
 #ifndef RAGE_DISPLAY_DEKO3D_H
 #define RAGE_DISPLAY_DEKO3D_H
@@ -12,6 +11,8 @@
 #include "Deko3DMemPool.h"
 #include <deko3d.hpp>
 #include <array>
+
+class RageCompiledGeometryDeko3D;
 
 class RageDisplay_Deko3D: public RageDisplay
 {
@@ -56,9 +57,7 @@ public:
 	virtual void SetEffectMode( EffectMode em );
 	virtual bool IsEffectModeSupported( EffectMode em );
 
-	// Phase 2 (Model lighting/materials) - not implemented yet. See
-	// 09-Deko3D-SpritePipelineCache.md S10 for the design (Material x Light
-	// must be multiplied in-shader; no such shader exists yet).
+	// Only light index 0 is implemented - the only index any real caller uses.
 	virtual void SetMaterial( const RageColor &emissive, const RageColor &ambient,
 		const RageColor &diffuse, const RageColor &specular, float shininess );
 	virtual void SetLighting( bool b );
@@ -90,6 +89,9 @@ private:
 	// Non-copyable.
 	RageDisplay_Deko3D( const RageDisplay_Deko3D & );
 	RageDisplay_Deko3D &operator=( const RageDisplay_Deko3D & );
+
+	// Needs private access to allocate/upload/draw model geometry (see .cpp).
+	friend class RageCompiledGeometryDeko3D;
 
 	// -- Setup helpers (Init) --
 	void CreateDeviceAndQueue();
@@ -142,7 +144,22 @@ private:
 	};
 	PendingState m_Pending;
 
-	void FlushState( dk::CmdBuf cmdbuf );
+	// Model material/light state; only light 0 is tracked (see class comment above).
+	struct ModelLightState
+	{
+		ModelLightState();
+		RageColor emissive, ambient, diffuse;
+		bool bLightingEnabled;
+		bool bLight0Enabled;
+		RageColor light0Ambient, light0Diffuse;
+		RageVector3 light0Dir;
+	};
+	ModelLightState m_ModelLight;
+
+	// Shared rasterizer/blend/depth/texture state; shader binding is separate
+	// (sprites and models use different shader pairs).
+	void FlushCommonState( dk::CmdBuf cmdbuf );
+	void FlushState( dk::CmdBuf cmdbuf ); // FlushCommonState() + sprite shader binding
 	dk::Sampler MakeSampler( bool bWrap, bool bFilter ) const;
 	int32_t GetOrCreateSamplerSlot( bool bWrap, bool bFilter );
 
@@ -227,6 +244,9 @@ private:
 	Deko3DRingPool *m_pDynamicDataPool;// Pattern D: per-frame vertex + uniform data
 	Deko3DDescriptorTable *m_pImageDescriptors;
 	Deko3DDescriptorTable *m_pSamplerDescriptors;
+	// Pattern B, like m_pImagePool: model vertex/index buffers, long-lived,
+	// alloc/freed like texture storage. CPU-visible so Change() can memcpy directly.
+	Deko3DFreeListPool *m_pModelGeometryPool;
 
 	// Feeds m_SetupCmdBuf a fresh chunk of memory from m_pSetupCmdPool.
 	// Must be called before every recording session on m_SetupCmdBuf (once
@@ -246,6 +266,8 @@ private:
 	// -- Shaders --
 	dk::Shader m_VertexShader;
 	dk::Shader m_FragmentShaders[NUM_SpriteShaderVariant];
+	dk::Shader m_ModelVertexShader;
+	dk::Shader m_ModelFragmentShader;
 
 	// -- Samplers: 4 fixed combinations (TextureWrapping x TextureFiltering), see doc 09 S4/S5 --
 	int32_t m_iSamplerSlot[2][2]; // [bWrap][bFilter], -1 until first requested
