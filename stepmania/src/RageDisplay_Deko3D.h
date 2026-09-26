@@ -26,6 +26,13 @@ public:
 	virtual void GetDisplaySpecs( DisplaySpecs &out ) const;
 	const RagePixelFormatDesc *GetPixelFormatDesc( RagePixelFormat pf ) const;
 
+	// deko3d (NVN/Vulkan-family) clips NDC Z to [0,1], unlike RageDisplay's
+	// base GetOrthoMatrix/GetFrustumMatrix which target OpenGL's [-1,1]. Left
+	// unoverridden, any actor Z motion (e.g. the "bob" effect) produces
+	// clip-space Z outside deko3d's valid range and gets clipped away.
+	virtual RageMatrix GetOrthoMatrix( float l, float r, float b, float t, float zn, float zf );
+	virtual RageMatrix GetFrustumMatrix( float l, float r, float b, float t, float zn, float zf );
+
 	virtual bool BeginFrame();
 	virtual void EndFrame();
 	virtual ActualVideoModeParams GetActualVideoModeParams() const;

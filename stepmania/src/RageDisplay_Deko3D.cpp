@@ -593,6 +593,38 @@ void RageDisplay_Deko3D::DestroySwapchain()
 }
 
 // ---------------------------------------------------------------------
+// Projection matrices
+// ---------------------------------------------------------------------
+// RageDisplay's base GetOrthoMatrix/GetFrustumMatrix target OpenGL's NDC Z
+// range [-1,+1]. deko3d (NVN/Vulkan-family, like D3D) clips NDC Z to [0,1],
+// so those matrices are remapped here via the standard z' = (z+w)/2 clip-space
+// adjustment (equivalent to scaling/biasing the z column by the w column).
+
+RageMatrix RageDisplay_Deko3D::GetOrthoMatrix( float l, float r, float b, float t, float zn, float zf )
+{
+	RageMatrix m(
+		2/(r-l),      0,            0,            0,
+		0,            2/(t-b),      0,            0,
+		0,            0,            -1/(zf-zn),   0,
+		-(r+l)/(r-l), -(t+b)/(t-b), -zn/(zf-zn),  1 );
+	return m;
+}
+
+RageMatrix RageDisplay_Deko3D::GetFrustumMatrix( float l, float r, float b, float t, float zn, float zf )
+{
+	float A = (r+l) / (r-l);
+	float B = (t+b) / (t-b);
+	float C = -zf / (zf-zn);
+	float D = -(zf*zn) / (zf-zn);
+	RageMatrix m(
+		2*zn/(r-l), 0,          0,  0,
+		0,          2*zn/(t-b), 0,  0,
+		A,          B,          C,  -1,
+		0,          0,          D,  0 );
+	return m;
+}
+
+// ---------------------------------------------------------------------
 // Frame lifecycle
 // ---------------------------------------------------------------------
 
