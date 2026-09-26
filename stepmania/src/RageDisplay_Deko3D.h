@@ -280,6 +280,11 @@ private:
 	int m_iCurFramebufferSlot;
 	int m_iWidth, m_iHeight;
 
+	// Single depth buffer, shared across framebuffer slots (not double-
+	// buffered like color - depth is per-frame scratch, never presented).
+	dk::Image m_DepthBuffer;
+	Deko3DAlloc m_DepthBufferMem;
+
 	ActualVideoModeParams m_CurrentParams;
 
 	// Diagnostic-only: counts BeginFrame()/EndFrame() calls separately so a

@@ -157,6 +157,18 @@ namespace
 		}
 	}
 
+	// Matches RageDisplay_Legacy::SetZTestMode's glDepthFunc mapping.
+	DkCompareOp RageToDkCompareOp( ZTestMode mode )
+	{
+		switch( mode )
+		{
+		case ZTEST_WRITE_ON_PASS: return DkCompareOp_Lequal;
+		case ZTEST_WRITE_ON_FAIL: return DkCompareOp_Greater;
+		case ZTEST_OFF:
+		default: return DkCompareOp_Always;
+		}
+	}
+
 	// deko3d's own fatal-error path (dk::detail::RaiseError, seen in every
 	// crash report so far as the frame right above svcBreak/User Break) logs
 	// nothing on its own before aborting - the crash report only gives us
@@ -550,6 +562,20 @@ void RageDisplay_Deko3D::CreateSwapchain( int iWidth, int iHeight )
 	}
 
 	m_Swapchain = dk::SwapchainMaker( m_Device, nwindowGetDefault(), images ).create();
+
+	// Z24S8 (no stencil use, but it's the precedented, known-working format).
+	dk::ImageLayout depthLayout;
+	dk::ImageLayoutMaker( m_Device )
+		.setFlags( DkImageFlags_UsageRender | DkImageFlags_HwCompression )
+		.setFormat( DkImageFormat_Z24S8 )
+		.setDimensions( iWidth, iHeight )
+		.initialize( depthLayout );
+
+	m_DepthBufferMem = m_pImagePool->Allocate( (uint32_t)depthLayout.getSize(), depthLayout.getAlignment() );
+	ASSERT_M( m_DepthBufferMem.IsValid(),
+		ssprintf("RageDisplay_Deko3D: depth buffer image pool allocation failed (%llu bytes) - "
+			"m_pImagePool likely exhausted, see IMAGE_POOL_SIZE", (unsigned long long)depthLayout.getSize()).c_str() );
+	m_DepthBuffer.initialize( depthLayout, m_DepthBufferMem.hBlock, m_DepthBufferMem.iOffset );
 }
 
 void RageDisplay_Deko3D::DestroySwapchain()
@@ -562,6 +588,8 @@ void RageDisplay_Deko3D::DestroySwapchain()
 
 	for( int i = 0; i < NUM_FRAMEBUFFERS; ++i )
 		m_pImagePool->Free( m_FramebufferMem[i] );
+
+	m_pImagePool->Free( m_DepthBufferMem );
 }
 
 // ---------------------------------------------------------------------
@@ -609,7 +637,8 @@ bool RageDisplay_Deko3D::BeginFrame()
 
 	RearmSetupCmdBuf();
 	dk::ImageView colorTarget( m_Framebuffers[m_iCurFramebufferSlot] );
-	m_SetupCmdBuf.bindRenderTargets( { &colorTarget }, nullptr );
+	dk::ImageView depthTarget( m_DepthBuffer );
+	m_SetupCmdBuf.bindRenderTargets( { &colorTarget }, &depthTarget );
 
 	// Same class of bug as the missing descriptor-set binding: deko3d has no
 	// default viewport/scissor derived from the bound render target's size -
@@ -701,7 +730,12 @@ void RageDisplay_Deko3D::SetBlendMode( BlendMode mode ) { m_Pending.blendMode = 
 void RageDisplay_Deko3D::SetCullMode( CullMode mode ) { m_Pending.cullMode = mode; }
 void RageDisplay_Deko3D::SetZTestMode( ZTestMode mode ) { m_Pending.zTestMode = mode; m_Pending.bZTest = (mode != ZTEST_OFF); }
 void RageDisplay_Deko3D::SetZWrite( bool b ) { m_Pending.bZWrite = b; }
-void RageDisplay_Deko3D::ClearZBuffer() { /* no depth buffer bound yet in Phase 1 (sprites don't need one); no-op */ }
+void RageDisplay_Deko3D::ClearZBuffer()
+{
+	// clearDepthStencil() always writes, unlike glClear(GL_DEPTH_BUFFER_BIT)
+	// (which respects glDepthMask) - no SetZWrite(true)/restore dance needed.
+	m_DynamicCmdBuf.clearDepthStencil( true, 1.0f, 0xFF, 0 );
+}
 void RageDisplay_Deko3D::SetTextureMode( TextureUnit /*tu*/, TextureMode tm ) { m_Pending.textureMode = tm; }
 void RageDisplay_Deko3D::SetTextureWrapping( TextureUnit /*tu*/, bool b ) { m_Pending.bTextureWrap = b; }
 void RageDisplay_Deko3D::SetTextureFiltering( TextureUnit /*tu*/, bool b ) { m_Pending.bTextureFilter = b; }
@@ -1297,6 +1331,7 @@ void RageDisplay_Deko3D::FlushCommonState( dk::CmdBuf cmdbuf )
 	dk::DepthStencilState depthState;
 	depthState.setDepthTestEnable( m_Pending.bZTest );
 	depthState.setDepthWriteEnable( m_Pending.bZWrite );
+	depthState.setDepthCompareOp( RageToDkCompareOp( m_Pending.zTestMode ) );
 	cmdbuf.bindDepthStencilState( depthState );
 
 	// ALWAYS bind something to fragment-stage slot 0, even for "no texture"
