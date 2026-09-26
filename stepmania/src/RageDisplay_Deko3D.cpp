@@ -169,6 +169,20 @@ namespace
 		}
 	}
 
+	// deko3d's automatic tile-height heuristic pads height by 1.5x for mip
+	// headroom we never use (CreateTexture never creates mipmaps), so it
+	// overshoots for short single-level textures and corrupts them. Compute
+	// the tile size from the real height instead.
+	DkTileSize PickTileSizeForHeight( uint32_t height )
+	{
+		uint32_t gobs = (height + 7) / 8; // one GOB is 8 rows tall
+		if( gobs >= 16 ) return DkTileSize_SixteenGobs;
+		if( gobs >= 8 )  return DkTileSize_EightGobs;
+		if( gobs >= 4 )  return DkTileSize_FourGobs;
+		if( gobs >= 2 )  return DkTileSize_TwoGobs;
+		return DkTileSize_OneGob;
+	}
+
 	// deko3d's own fatal-error path (dk::detail::RaiseError, seen in every
 	// crash report so far as the frame right above svcBreak/User Break) logs
 	// nothing on its own before aborting - the crash report only gives us
@@ -1148,9 +1162,10 @@ uintptr_t RageDisplay_Deko3D::CreateTexture( RagePixelFormat pixfmt, RageSurface
 
 	dk::ImageLayout layout;
 	dk::ImageLayoutMaker( m_Device )
-		.setFlags( 0 )
+		.setFlags( DkImageFlags_CustomTileSize )
 		.setFormat( dkFormat )
 		.setDimensions( iAllocWidth, iAllocHeight )
+		.setTileSize( PickTileSizeForHeight( (uint32_t)iAllocHeight ) )
 		.initialize( layout );
 
 	TextureRecord *pRec = new TextureRecord();
